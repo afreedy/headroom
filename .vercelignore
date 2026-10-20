@@ -1,0 +1,5 @@
+connector/
+tests/
+README.md
+*.command
+**/__pycache__/
