@@ -11,3 +11,21 @@ test('stale, exhausted, errored, unknown or passed-reset accounts are not recomm
 });
 
 test('reset expiry handles missing, future and elapsed timestamps honestly',()=>{assert.equal(expiryText(null),'Expiry not provided');assert.equal(expiryText(1,2000),'Expired · refresh to confirm');assert.equal(expiryText(3660,0),'1h 1m left');});
+
+test('failed, disconnected and stale readings are never shown as current', async () => {
+ const {freshReading}=await import('../public/usage.js');
+ const a={updatedAt:1000};
+ assert.equal(freshReading(a,true,1000000),true);
+ assert.equal(freshReading({...a,error:'offline'},true,1000000),false);
+ assert.equal(freshReading({...a,needsLogin:true},true,1000000),false);
+ assert.equal(freshReading(a,false,1000000),false);
+ assert.equal(freshReading(a,true,1400000),false);
+});
+
+test('a passed reset hides the old percentage until a new window is returned', async () => {
+ const {currentWindow}=await import('../public/usage.js');
+ const old={usedPercent:48,resetsAt:1000};
+ assert.equal(remaining(currentWindow(old,1000001)),null);
+ assert.equal(remaining(currentWindow({...old,resetsAt:2000},1000001)),52);
+ assert.equal(old.usedPercent,48);
+});

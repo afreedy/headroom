@@ -23,3 +23,11 @@ export function expiryText(timestamp, now = Date.now()) {
   if (timestamp * 1000 <= now) return 'Expired · refresh to confirm';
   return resetText(timestamp, now) + ' left';
 }
+
+export function freshReading(account, connected, now = Date.now()) {
+  return connected && !account.error && !account.needsLogin && !stale(account, now);
+}
+
+export function currentWindow(window, now = Date.now()) {
+  return window?.resetsAt && window.resetsAt * 1000 <= now ? {...window, usedPercent: null} : window;
+}

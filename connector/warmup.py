@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-"""One reset-aware pass; called by the Headroom heartbeat, not a polling LLM."""
-import argparse, fcntl, hashlib, json, math, time
-from datetime import datetime
-from zoneinfo import ZoneInfo
+"""Per-account warmup planning owned by Headroom's local connector."""
+import hashlib, json, time, math
 from pathlib import Path
 from server import DATA, Rpc
 
@@ -24,9 +22,11 @@ def read_account(rpc, expected):
 def plan(bucket, previous, now):
     primary=bucket.get('primary') or {}; weekly=bucket.get('secondary') or {}
     reset=primary.get('resetsAt');used=primary.get('usedPercent')
-    if primary.get('windowDurationMins')!=300 or not isinstance(reset,(int,float)) or reset<=0 or not isinstance(used,(int,float)):
+    if primary.get('windowDurationMins')!=300 or not isinstance(reset,(int,float)) or reset<=0 or not isinstance(used,(int,float)) or not math.isfinite(reset) or not math.isfinite(used) or not 0 <= used <= 100:
         return False,None,now+900,'Five-hour window unavailable'
-    if weekly.get('usedPercent',0) is not None and weekly.get('usedPercent',0)>=100:
+    if not isinstance(weekly.get('usedPercent'), (int,float)) or not math.isfinite(weekly['usedPercent']) or not 0 <= weekly['usedPercent'] <= 100:
+        return False,None,now+60,'Weekly quota unavailable'
+    if weekly['usedPercent']>=100:
         end=weekly.get('resetsAt')
         return False,None,max(now+900,end+GRACE if isinstance(end,(int,float)) else 0),'Weekly limit exhausted'
     anchor=previous.get('nextReset',reset)
@@ -35,7 +35,7 @@ def plan(bucket, previous, now):
     due=expired or (anchor+GRACE<=now and unstarted)
     key=reset if expired else anchor
     attempted=previous.get('attemptedReset')
-    if due and attempted is not None and abs(attempted-key)<120:
+    if due and attempted is not None and (abs(attempted-key)<120 or previous.get('outcome') in ('pending','uncertain') and key <= attempted+300*60):
         return False,key,now+1800,'Already attempted this reset; no duplicate sent'
     return due,key,max(now+120,reset+GRACE), 'Due' if due else 'Current window is already active'
 
@@ -52,51 +52,46 @@ def send_hi(rpc, workspace):
     if turn.get('status')!='completed':raise RuntimeError((turn.get('error') or {}).get('message') or 'Message did not complete.')
     return model['model']
 
-def run(execute=False, probe=None):
-    targets=json.loads((DATA/'warmup-targets.json').read_text());state_path=DATA/'warmup-state.json'
-    state=json.loads(state_path.read_text()) if state_path.exists() else {}
-    workspace=DATA/'warmup-workspace';workspace.mkdir(exist_ok=True,mode=0o700)
-    results=[];checks=[]
-    for target in targets:
-        ident=target['id'];previous=state.get(ident,{})
-        if probe and probe!=ident:continue
-        rpc=None
-        try:
-            rpc=Rpc(target.get('home'));bucket=read_account(rpc,ident);now=time.time()
-            due,anchor,next_check,reason=plan(bucket,previous,now)
-            entry=dict(previous);entry.pop('error',None)
-            if due and execute or probe:
-                # Persist intent before inference: a crash must not repeat a possibly completed request.
-                if not probe:
-                    entry.update(attemptedReset=anchor,outcome='pending',attemptedAt=now);state[ident]=entry;atomic_save(state_path,state)
-                model=send_hi(rpc,workspace)
-                after=read_account(rpc,ident);reset=(after.get('primary') or {}).get('resetsAt')
-                confirmed=isinstance(reset,(int,float)) and reset>time.time()+60
-                entry.update(outcome='completed' if confirmed else 'completed_reset_unconfirmed',lastCompletedAt=time.time(),model=model)
-                if isinstance(reset,(int,float)):
-                    entry['nextReset']=reset;next_check=max(time.time()+120,reset+GRACE)
-                reason='hi completed; '+('reset timestamp read' if confirmed else 'new reset not confirmed')
-            elif not due:
-                reset=(bucket.get('primary') or {}).get('resetsAt')
-                if isinstance(reset,(int,float)) and reset>now and reason!='Weekly limit exhausted':entry['nextReset']=reset
-                entry.setdefault('outcome','waiting')
-            entry['checkedAt']=time.time();state[ident]=entry
-            results.append({'accountId':ident,'status':reason,'sendDue':due,'sent':bool((due and execute) or probe),'nextCheckAt':next_check})
-            checks.append(next_check)
-        except Exception as error:
-            entry=state.get(ident,{})
-            entry.update(error=str(error),checkedAt=time.time());state[ident]=entry
-            results.append({'accountId':ident,'error':str(error),'sent':None if entry.get('outcome')=='pending' else False});checks.append(time.time()+900)
-        finally:
-            if rpc:rpc.close()
-    atomic_save(state_path,state)
-    next_at=math.ceil(max(time.time()+120,min(checks,default=time.time()+900))/60)*60
-    local=datetime.fromtimestamp(next_at,ZoneInfo('Asia/Singapore'))
-    return {'accounts':results,'nextCheckLocal':local.isoformat(),'rrule':f'RRULE:FREQ=DAILY;BYHOUR={local.hour};BYMINUTE={local.minute};BYSECOND=0'}
+def process_account(rpc, row, state, state_path):
+    """Uses a fresh identity-checked snapshot; persist intent before any inference."""
+    ident = row['id']; previous = state.get(ident, {})
+    bucket = (row.get('buckets') or {}).get('codex') or {}
+    now = time.time(); due, anchor, next_check, reason = plan(bucket, previous, now)
+    entry = dict(previous)
+    if previous.get('outcome') not in ('pending','uncertain'): entry.pop('error', None)
+    if previous.get('outcome') in ('pending','uncertain') and reason.startswith('Already attempted'):
+        reason = 'Completion uncertain; no resend for this window'
+    entry.update(checkedAt=now, nextCheckAt=next_check, status=reason)
+    state[ident] = entry
+    if not due:
+        reset = (bucket.get('primary') or {}).get('resetsAt')
+        if isinstance(reset, (int,float)) and reset > now and reason == 'Current window is already active':
+            entry['nextReset'] = reset
+        atomic_save(state_path, state)
+        return
+    workspace = DATA/'warmup-workspace'; workspace.mkdir(exist_ok=True, mode=0o700)
+    entry.update(attemptedReset=anchor, outcome='pending', attemptedAt=now, status='Sending hi')
+    atomic_save(state_path, state)
+    try:
+        model = send_hi(rpc, workspace)
+    except Exception as error:
+        entry.update(outcome='uncertain', status='Warmup needs attention; no resend for this window', error=str(error), nextCheckAt=time.time()+1800)
+        atomic_save(state_path, state)
+        return
+    entry.update(outcome='completed', lastCompletedAt=time.time(), model=model, status='hi completed')
+    # Record completion before the follow-up read; quota failure must not undo it.
+    atomic_save(state_path, state)
+    try:
+        after = read_account(rpc, ident)
+        row['buckets']['codex'] = after; row['updatedAt'] = time.time()
+        reset = (after.get('primary') or {}).get('resetsAt')
+        if isinstance(reset, (int,float)) and reset > time.time():
+            entry.update(nextReset=reset, nextCheckAt=reset+GRACE)
+        else:
+            entry.update(status='hi completed; reset time unconfirmed', nextCheckAt=time.time()+60)
+    except Exception as error:
+        entry.update(status='hi completed; quota refresh failed', error=str(error), nextCheckAt=time.time()+60)
+    atomic_save(state_path, state)
 
-def main():
-    p=argparse.ArgumentParser();p.add_argument('--execute',action='store_true');p.add_argument('--probe');args=p.parse_args()
-    with (DATA/'warmup.lock').open('a') as lock:
-        fcntl.flock(lock,fcntl.LOCK_EX)
-        print(json.dumps(run(args.execute,args.probe)))
-if __name__=='__main__':main()
+if __name__ == '__main__':
+    raise SystemExit('Warmups are managed by the Headroom connector. Start server.py instead.')

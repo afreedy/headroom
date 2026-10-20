@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Local-only Codex usage bridge. No OAuth credentials leave the Mac."""
-import argparse, hashlib, json, os, secrets, shutil, subprocess, threading, time, webbrowser
+import argparse, hashlib, json, os, secrets, shutil, subprocess, threading, time, webbrowser, sys
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -8,6 +8,9 @@ DATA = Path(os.environ.get('HEADROOM_DATA', str(Path.home() / 'Library/Applicati
 BINARY = os.environ.get('CODEX_BIN') or ('/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex' if Path('/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex').exists() else shutil.which('codex'))
 LOCK = threading.Lock()
 LOGIN = {}
+WAKE = threading.Event()
+# One module instance shares the refresh lock with the warmup worker.
+if __name__ == "__main__": sys.modules["server"] = sys.modules[__name__]
 
 class Rpc:
     def __init__(self, home=None):
@@ -59,34 +62,55 @@ def normalize(account, result, home):
     buckets = result.get('rateLimitsByLimitId') or {'codex': result.get('rateLimits')}
     return {'id': hashlib.sha256(key.encode()).hexdigest()[:20], 'email': account.get('email'), 'plan': account.get('planType'), 'home': str(home) if home else None, 'updatedAt': time.time(), 'buckets': buckets, 'resetCredits': (result.get('rateLimitResetCredits') or {}).get('availableCount'), 'resetCreditDetails': [{k: c.get(k) for k in ('title', 'grantedAt', 'expiresAt')} for c in result['rateLimitResetCredits']['credits']] if (result.get('rateLimitResetCredits') or {}).get('credits') is not None else None, 'error': None}
 
-def fetch(home=None):
-    rpc = Rpc(home)
-    try:
-        a = rpc.call('account/read', {'refreshToken': False}).get('account')
-        r = rpc.call('account/rateLimits/read')
-        return normalize(a, r, home)
-    finally: rpc.close()
-
-def refresh():
+def refresh(warm=False):
+    from warmup import process_account
     with LOCK:
-        rows = load(); homes = [None] + [p for p in (DATA/'accounts').glob('*') if p.is_dir() and (p/'auth.json').exists()]
-        active = None; errors = []
-        for home in homes:
+        rows = load(); errors = []; state_path = DATA/'warmup-state.json'
+        state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        for index, old in enumerate(rows):
+            rpc = None
             try:
-                row = fetch(home)
-                if home is None: active = row['id']
-                old = next((x for x in rows if x['id'] == row['id']), None)
-                if old: rows.remove(old)
-                rows.append(row)
+                home = old.get('home')
+                if not home or not Path(home).is_relative_to(DATA/'accounts') or not (Path(home)/'auth.json').exists():
+                    old['needsLogin'] = True
+                    raise RuntimeError('Reconnect this account once for independent refresh and warmup.')
+                rpc = Rpc(home)
+                account = rpc.call('account/read', {'refreshToken': False}).get('account')
+                limits = rpc.call('account/rateLimits/read')
+                row = normalize(account, limits, home)
+                if row['id'] != old['id']:
+                    old['needsLogin'] = True
+                    raise RuntimeError('Saved login belongs to a different account. Reconnect this account.')
+                row['needsLogin'] = False
+                rows[index] = row
+                if warm:
+                    process_account(rpc, row, state, state_path)
+                row['warmup'] = state.get(row['id'], {})
             except Exception as e:
+                current = rows[index]
+                current['error'] = str(e); current['lastAttemptAt'] = time.time()
+                current['warmup'] = state.get(current['id'], {})
                 errors.append(str(e))
-                for row in rows:
-                    if row.get('home') == (str(home) if home else None): row['error'] = str(e)
+            finally:
+                if rpc: rpc.close()
         save(rows)
-        # Only quota and identity metadata cross the loopback boundary.
-        return {'accounts': [{k:v for k,v in row.items() if k != 'home'} for row in rows], 'activeId': active, 'errors': errors, 'checkedAt': time.time()}
+        return {'accounts': [{k:v for k,v in row.items() if k != 'home'} for row in rows], 'activeId': None, 'errors': errors, 'checkedAt': time.time(), 'scheduler': True}
 
-def start_login():
+def scheduler_delay(rows, now):
+    deadlines = [(r.get('warmup') or {}).get('nextCheckAt') for r in rows if not r.get('error')]
+    return max(1, min([60] + [t-now for t in deadlines if isinstance(t, (int,float))]))
+
+def scheduler():
+    while True:
+        try:
+            refresh(warm=True)
+            delay = scheduler_delay(load(), time.time())
+        except Exception:
+            delay = 60
+        WAKE.wait(delay); WAKE.clear()
+
+def start_login(expected=None):
+    if expected and expected not in {r["id"] for r in load()}: raise RuntimeError("Unknown account.")
     if LOGIN.get('running'): raise RuntimeError('A sign-in is already open. Finish it in your browser first.')
     home = DATA / 'accounts' / secrets.token_hex(8); home.mkdir(parents=True, mode=0o700)
     rpc = Rpc(home)
@@ -102,10 +126,22 @@ def start_login():
                 result = getattr(rpc, 'login_result', None)
                 if result is not None:
                     if not result.get('success'): raise RuntimeError(result.get('error') or 'Sign-in failed.')
+                    account = rpc.call('account/read', {'refreshToken': False}).get('account')
+                    row = normalize(account, rpc.call('account/rateLimits/read'), home)
+                    if expected and row['id'] != expected:
+                        raise RuntimeError('You signed into a different account. Reconnect the intended account.')
+                    with LOCK:
+                        rows = load(); previous = next((r for r in rows if r['id'] == row['id']), None)
+                        row['warmup'] = (previous or {}).get('warmup', {})
+                        save([r for r in rows if r['id'] != row['id']] + [row])
+                    WAKE.set()
                     return
                 time.sleep(1)
             raise RuntimeError('Sign-in timed out. Try connecting the account again.')
-        except Exception as e: LOGIN['error'] = str(e)
+        except Exception as e:
+            LOGIN['error'] = str(e)
+            # Only a newly created, unsuccessful login directory is removed.
+            rpc.close(); shutil.rmtree(home)
         finally: rpc.close(); LOGIN['running'] = False
     threading.Thread(target=wait, daemon=True).start()
     return {'url': url}
@@ -126,8 +162,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get('Origin') not in self.server.origins: return self.reply(403, {'error':'Origin denied'})
         if not secrets.compare_digest(self.headers.get('Authorization',''), 'Bearer '+self.server.token): return self.reply(401, {'error':'Pair the dashboard with your local connector.'})
         try:
-            if self.command == 'GET' and self.path == '/usage': return self.reply(200, {**refresh(), 'login': LOGIN})
-            if self.command == 'POST' and self.path == '/login': return self.reply(200, start_login())
+            if self.command == 'GET' and self.path == '/usage':
+                result = refresh(); WAKE.set()
+                return self.reply(200, {**result, 'login': LOGIN})
+            if self.command == 'POST' and self.path.startswith('/login'):
+                from urllib.parse import urlparse, parse_qs
+                u = urlparse(self.path)
+                if u.path == '/login': return self.reply(200, start_login(parse_qs(u.query).get('account', [None])[0]))
             return self.reply(404, {'error':'Not found'})
         except Exception as e: self.reply(500, {'error':str(e)})
     do_GET = route
@@ -145,5 +186,6 @@ def main():
     server=ThreadingHTTPServer(('127.0.0.1',4318),Handler); server.origin=args.origin.rstrip('/'); server.origins={server.origin, *args.allow_origin}; server.token=token
     if args.open: webbrowser.open(server.origin+'/#pair='+token)
     print('Headroom connector listening on 127.0.0.1:4318. Credentials stay local.',flush=True)
+    threading.Thread(target=scheduler, daemon=True).start()
     server.serve_forever()
 if __name__ == '__main__': main()

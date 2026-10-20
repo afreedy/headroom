@@ -1,40 +1,56 @@
 # Headroom
 
-A dashboard for multiple Codex accounts: remaining usage, reset countdowns and banked reset expiry dates.
+Usage limits, reset countdowns and banked reset expiries for multiple Codex accounts.
 
-**Live website:** [headroom-usage.vercel.app](https://headroom-usage.vercel.app). The current Vercel deployment requires Vercel sign-in. Live account readings require the local connector on the same Mac; no credentials are hosted on Vercel.
+[Live dashboard](https://headroom-usage.vercel.app) (current Vercel deployment requires Vercel sign-in). Account credentials stay on your Mac.
 
-## Run locally
+## Setup on macOS
 
-Requirements: macOS, Python 3.10+ and a signed-in Codex desktop app or CLI. The connector uses the desktop bundled binary when available, or `codex` on PATH. Set `CODEX_BIN` to an absolute binary path if needed.
+Install Codex and Python 3.10+, then install the connector as a login service:
+
+```sh
+python3 connector/install.py --origin https://headroom-usage.vercel.app
+```
+
+The service starts at login and restarts after crashes. It uses the bundled Codex binary or `codex` on PATH. Launch the dashboard paired once:
+
+```sh
+python3 connector/server.py --origin https://headroom-usage.vercel.app --open
+```
+
+If the installed service is already running, use the local pairing key in `~/Library/Application Support/Headroom/pairing-key` in the dashboard's Connector dialog instead of starting a second server. Never share this key.
+
+Choose **Connect account** and sign into each account separately. Every account gets its own local Codex profile; switching the Codex desktop login does not change those connections. Legacy desktop-linked accounts show **Reconnect account** until signed in independently. Account names are browser-local.
+
+## Automatic refresh and warmup
+
+The connector refreshes all saved accounts at least once per minute while running. Each account's warmup follows the latest returned five-hour reset timestamp, with a 30-second grace period. Earlier deadlines shorten the worker's wait; late starts and wake-from-sleep checks do not wait for a daily wall-clock time. Closing the browser or Codex chat does not stop the login service. No Codex automation is used.
+
+After a five-hour reset, the connector sends a minimal `hi` through that account's subscription and verifies completion. It skips active windows, exhausted weekly quotas, unknown quotas, failed refreshes and mismatched identities. Intent is saved before sending; failed or uncertain attempts are not resent for the same window. The dashboard shows warmup status and last completion. Exact quota-window anchoring is not documented by OpenAI; a completed hi does not guarantee a particular future reset timestamp. A warmup consumes a small amount of subscription usage. Banked resets are displayed only and are never redeemed; API-key billing is not used.
+
+Old usage percentages and banked-reset counts are hidden when disconnected, stale or errored. Only fresh returned values are shown. Authentication can expire and may require reconnecting the affected account. The Mac must be awake, logged in and online; missed checks resume automatically when available. Windows startup packaging is not implemented.
+
+To stop automatic operation:
+
+```sh
+launchctl bootout gui/$(id -u)/com.afreedy.headroom
+# Remove ~/Library/LaunchAgents/com.afreedy.headroom.plist to stop future login starts.
+```
+
+For development without installing a service:
 
 ```sh
 python3 -m http.server 4174 --bind 127.0.0.1 --directory public
-# In a second terminal:
 python3 connector/server.py --origin http://127.0.0.1:4174 --open
 ```
 
-For the hosted dashboard, run `python3 connector/server.py --origin https://headroom-usage.vercel.app --open`, or open `Start Headroom.command`. Keep the connector running and allow the browser's local-device permission. Connect each account through the UI for independent saved logins. Desktop login changes do not replace independently connected accounts.
+## Privacy and checks
 
-## Privacy and limits
-
-OAuth credentials and account snapshots are stored under `~/Library/Application Support/Headroom/` with restricted file permissions. The server binds to loopback only, validates the Host, exact allowed origin and pairing key, and returns quota metadata to the paired browser. Browser-local account labels and readings are not synced across browsers. Do not publish the private data directory, pairing key, browser storage or auth files. This source export includes none of them.
-
-The five-hour and weekly labels come from returned window durations. Unknown values remain unknown. A reset passing does not fabricate refreshed capacity. Banked resets are displayed only; the dashboard does not redeem them. Windows packaging and clean-machine setup are unverified.
-
-## Optional warmup helper
-
-`connector/warmup.py` is an opt-in local helper that sends one tiny `hi` after a reported five-hour reset, checks fixed account identities, skips exhausted weekly quotas and persists attempts before sending. It uses ephemeral read-only Codex turns and no API-key billing. Exact window anchoring is undocumented. Running the helper consumes a small amount of subscription usage.
-
-The personal scheduler and account configuration are deliberately excluded. To configure your own helper, populate `warmup-targets.json` in the private Headroom directory with objects containing your account `id` from the connector snapshot and the absolute `home` of its dedicated Codex profile. A `null` home follows the desktop login and stops working for that account if you switch logins. Review the helper before enabling an OS scheduler. Do not copy another person's credentials.
-
-## Check
+Credentials, account snapshots and the attempt ledger live under `~/Library/Application Support/Headroom/`, outside this repository. The connector binds to loopback and checks Host, allowed origin and pairing key. No credentials or personal records are hosted on Vercel. Do not publish the private data directory.
 
 ```sh
 node --test tests/usage.test.mjs
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Desktop/mobile rendering and two-account use were checked on the developer's Mac. This is a source release, not a signed installer.
-
-Design is inspired by the supplied AI in Design Report reference; original typography assets and captures are not included. Uses system fonts and an original SVG mark.
+Design inspired by the supplied AI in Design Report reference; captured source assets are excluded. Uses system fonts and an original SVG mark.

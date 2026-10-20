@@ -1,4 +1,4 @@
-import { remaining, resetText, duration, stale, eligible, expiryText } from './usage.js';
+import { remaining, resetText, duration, stale, eligible, expiryText, freshReading, currentWindow } from './usage.js';
 const $ = id => document.getElementById(id);
 let key = localStorage.getItem('headroom-pair') || '';
 const hash = new URLSearchParams(location.hash.slice(1));
@@ -28,11 +28,12 @@ function empty(i){return `<article class="account empty"><div class="account-top
 function render(){
  const expanded = new Set([...document.querySelectorAll('.reset-inventory[open]')].map(el=>el.dataset.account));
  $('accounts').innerHTML = accounts.map((a,i)=>{
- const bucket=getBucket(a),primary=bucket.primary, secondary=bucket.secondary, r=remaining(primary);
- const status=a.error?'Refresh failed':!connected||stale(a)?'Saved reading':activeId===a.id?'Desktop account':'Connected';
- return `<article class="account"><div class="account-top"><div class="account-title"><span class="avatar">${escape((a.email || `Account ${i+1}`)[0].toUpperCase())}</span><div><h2>${escape(accountName(a,i))} <button class="rename" data-rename="${escape(a.id)}" aria-label="Rename ${escape(accountName(a,i))}" title="Rename account">✎</button></h2><p class="identity">${escape(a.email || 'ChatGPT account')} / ${escape(a.plan || bucket.planType || 'Plan unavailable')}</p></div></div><span class="badge">${status}</span></div><div class="big-label">${escape(duration(primary?.windowDurationMins))}</div><div class="reading"><div class="number">${r??'—'}<small>${r!==null?'%':''}</small></div><span>remaining</span></div>${meter(primary,true)}${resetLine(primary)}${secondary?weekly(secondary):'<div class="weekly"><p class="empty-note">No second usage window returned by Codex.</p></div>'}${Object.entries(a.buckets||{}).filter(([id])=>id!==(bucket.limitId||'codex')).map(([id,b])=>`<details class="extra"><summary>${escape(b.limitName||id)}</summary>${b.primary?weekly(b.primary):''}${b.secondary?weekly(b.secondary):''}</details>`).join('')}<div class="account-bottom"><span>${a.error?escape(a.error):''}</span><span>Updated ${age(a.updatedAt)}</span></div>${bankedResets(a,expanded)}</article>`;
+ const fresh=freshReading(a,connected),bucket=fresh?getBucket(a):{},primary=currentWindow(bucket.primary), secondary=currentWindow(bucket.secondary), r=remaining(primary);
+ const status=a.needsLogin?'Sign-in required':a.error?'Refresh failed':!fresh?'Saved reading':'Connected';
+ return `<article class="account"><div class="account-top"><div class="account-title"><span class="avatar">${escape((a.email || `Account ${i+1}`)[0].toUpperCase())}</span><div><h2>${escape(accountName(a,i))} <button class="rename" data-rename="${escape(a.id)}" aria-label="Rename ${escape(accountName(a,i))}" title="Rename account">✎</button></h2><p class="identity">${escape(a.email || 'ChatGPT account')} / ${escape(a.plan || bucket.planType || 'Plan unavailable')}</p></div></div><span class="badge">${status}</span></div><div class="big-label">${fresh?escape(duration(primary?.windowDurationMins)):'Current usage unavailable'}</div><div class="reading"><div class="number">${r??'—'}<small>${r!==null?'%':''}</small></div><span>remaining</span></div>${meter(primary,true)}${resetLine(primary)}${secondary?weekly(secondary):'<div class="weekly"><p class="empty-note">No second usage window returned by Codex.</p></div>'}${Object.entries(fresh?a.buckets||{}:{}).filter(([id])=>id!==(bucket.limitId||'codex')).map(([id,b])=>`<details class="extra"><summary>${escape(b.limitName||id)}</summary>${b.primary?weekly(b.primary):''}${b.secondary?weekly(b.secondary):''}</details>`).join('')}<div class="account-bottom"><span>${a.error?escape(a.error):!fresh?'Reconnect to refresh; previous readings are hidden.':''}</span><span>Updated ${age(a.updatedAt)}</span></div>${a.needsLogin?`<button class="outline-button" data-reconnect="${escape(a.id)}">Reconnect account</button>`:''}<div class="account-bottom"><span>Warmup: ${escape(a.needsLogin?'Sign-in required':a.warmup?.status||'Waiting for connector')}</span><span>${a.warmup?.lastCompletedAt?'Last hi '+escape(fullDate(a.warmup.lastCompletedAt)):''}</span></div>${fresh?bankedResets(a,expanded):'<div class="reset-inventory">Banked resets unavailable until refresh succeeds</div>'}</article>`;
  }).join('') + Array.from({length:Math.max(0,2-accounts.length)},(_,i)=>empty(accounts.length+i)).join('');
- document.querySelectorAll('[data-connect]').forEach(b=>b.onclick=connectAccount);
+ document.querySelectorAll('[data-connect]').forEach(b=>b.onclick=()=>connectAccount());
+ document.querySelectorAll('[data-reconnect]').forEach(b=>b.onclick=()=>connectAccount(b.dataset.reconnect));
  document.querySelectorAll('[data-rename]').forEach(b=>b.onclick=()=>{
    const id=b.dataset.rename, i=accounts.findIndex(a=>a.id===id);
    renameId=id;
@@ -42,7 +43,7 @@ function render(){
    $('account-name').focus();$('account-name').select();
  });
  const upcoming=[];
- accounts.forEach((a,i)=>Object.entries(a.buckets||{}).forEach(([id,b])=>{if(!b)return;[b.primary,b.secondary].filter(Boolean).forEach(w=>{if(w.resetsAt)upcoming.push({a,i,id,b,w});});}));
+ accounts.forEach((a,i)=>Object.entries(freshReading(a,connected)?a.buckets||{}:{}).forEach(([id,b])=>{if(!b)return;[b.primary,b.secondary].filter(Boolean).forEach(w=>{if(w.resetsAt)upcoming.push({a,i,id,b,w});});}));
  upcoming.sort((a,b)=>a.w.resetsAt-b.w.resetsAt);
  $('schedule').innerHTML=upcoming.length?upcoming.slice(0,6).map(({a,i,id,b,w})=>`<div class="schedule-row"><div><strong>${escape(accountName(a,i))}</strong><small>${escape(id==='codex'?duration(w.windowDurationMins):(b.limitName||id)+' / '+duration(w.windowDurationMins))}</small></div><span>${escape(fullDate(w.resetsAt))}</span><strong>${escape(resetText(w.resetsAt))}</strong></div>`).join(''):'<p class="schedule-empty">Your next resets will appear after you connect an account.</p>';
  const ready=accounts.filter(a=>connected&&eligible(a));
@@ -57,14 +58,14 @@ async function request(path,method='GET'){
 async function sync(){
  if(busy)return;if(!key){$('status').textContent='Connect your Mac to see real usage';return;}
  busy=true;$('refresh').disabled=true;$('status').textContent='Reading account limits…';
- try{const data=await request('/usage'); accounts=data.accounts;activeId=data.activeId;connected=true;localStorage.setItem('headroom-snapshots',JSON.stringify(accounts));$('status').textContent=data.login?.running?'Finish signing in in the opened browser':data.login?.error?data.login.error:data.errors?.length?'Some readings failed · see account details':`Connected to this Mac / Updated ${new Date().toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'})}`;}
+ try{const data=await request('/usage'); accounts=data.accounts;activeId=data.activeId;connected=true;if(data.login?.running)setTimeout(sync,3000);localStorage.setItem('headroom-snapshots',JSON.stringify(accounts));$('status').textContent=data.login?.running?'Finish signing in in the opened browser':data.login?.error?data.login.error:data.errors?.length?'Some readings failed · see account details':`Connected to this Mac / Updated ${new Date().toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'})}`;}
  catch(e){connected=false;$('status').textContent=e.message.includes('fetch')||e.name==='TimeoutError'?'Connector unavailable · start it on this Mac':e.message;}
  finally{busy=false;$('refresh').disabled=false;render();}
 }
-async function connectAccount(){
+async function connectAccount(expected=null){
  if(!key||!connected){openConnection();return;}
  const popup=window.open('about:blank','_blank');
- try{const data=await request('/login','POST');if(popup){popup.opener=null;popup.location.href=data.url;}else toast('Allow pop-ups, then finish the account sign-in.');$('status').textContent='Finish signing in in the opened browser';setTimeout(sync,5000);}
+ try{const data=await request('/login'+(expected?'?account='+encodeURIComponent(expected):''),'POST');if(popup){popup.opener=null;popup.location.href=data.url;}else toast('Allow pop-ups, then finish the account sign-in.');$('status').textContent='Finish signing in in the opened browser';setTimeout(sync,5000);}
  catch(e){popup?.close();toast(e.message);}
 }
 let renameId=null;
@@ -76,7 +77,7 @@ $('rename-form').onsubmit=e=>{
  $('rename-dialog').close();render();
 };
 $('command').textContent=`python3 "${'connector/server.py'}" --origin ${location.origin} --open`;
-$('connection').onclick=openConnection;$('how').onclick=openConnection;$('add').onclick=connectAccount;
+$('connection').onclick=openConnection;$('how').onclick=openConnection;$('add').onclick=()=>connectAccount();
 $('pair').onclick=()=>{const value=$('key').value.trim();if(value.length<20){$('dialog-message').textContent='Enter the pairing key created by your local connector.';return;}key=value;localStorage.setItem('headroom-pair',key);$('key').value='';$('dialog').close();sync();};
 $('refresh').onclick=()=>key?sync():openConnection();
 render();sync();setInterval(()=>{render();if($('auto').checked&&!document.hidden)sync();},60000);
