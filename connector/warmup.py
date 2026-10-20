@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Per-account warmup planning owned by Headroom's local connector."""
-import hashlib, json, time, math
+import hashlib, json, time, math, uuid
+from receipts import write_receipt, capture, update, record_event
 from pathlib import Path
 from server import DATA, Rpc
 
@@ -39,16 +40,29 @@ def plan(bucket, previous, now):
         return False,key,now+1800,'Already attempted this reset; no duplicate sent'
     return due,key,max(now+120,reset+GRACE), 'Due' if due else 'Current window is already active'
 
-def send_hi(rpc, workspace):
+def send_hi(rpc, workspace, receipt=None, persist=None):
     models=rpc.call('model/list', {'limit':100,'includeHidden':False}).get('data',[])
     model=next((m for m in models if m.get('model')=='gpt-6-luna'),None) or next((m for m in models if m.get('isDefault')),None)
     if not model:raise RuntimeError('No supported Codex model returned.')
     efforts=[e.get('reasoningEffort') for e in model.get('supportedReasoningEfforts',[])]
     effort=next((e for e in ('minimal','low','medium') if e in efforts),model.get('defaultReasoningEffort','low'))
+    if receipt is not None:
+        update(DATA,receipt,model=model['model'], reasoningEffort=effort, request='hi', instructions='Reply exactly hi. Do not use tools.', sandbox='read-only', ephemeral=True)
+        persist()
     thread=rpc.call('thread/start', {'model':model['model'],'cwd':str(workspace),'ephemeral':True,'approvalPolicy':'never','sandbox':'read-only','baseInstructions':'Reply exactly hi. Do not use tools.','developerInstructions':'','config':{'model_reasoning_effort':effort,'model_verbosity':'low'}})
-    rpc.call('turn/start', {'threadId':thread['thread']['id'],'input':[{'type':'text','text':'hi'}],'effort':effort,'summary':'none'})
+    if receipt is not None:
+        update(DATA,receipt,threadId=thread['thread']['id'],requestedModel=model['model'],reportedModel=thread.get('model'));persist()
+        def event(method, params):
+            record_event(DATA,receipt,method,params)
+        rpc.capture_event=event
+    started=rpc.call('turn/start', {'threadId':thread['thread']['id'],'input':[{'type':'text','text':'hi'}],'effort':effort,'summary':'none'})
+    if receipt is not None:
+        update(DATA,receipt,turnId=(started.get('turn') or {}).get('id',receipt.get('turnId')));persist()
     if not rpc.turn_done.wait(90):raise RuntimeError('Message completion uncertain; no automatic resend for this reset.')
     turn=rpc.turn_result
+    if receipt is not None:
+        if not receipt.get('completionStatus'):
+            record_event(DATA,receipt,'turn/completed',{'threadId':receipt['threadId'],'turn':turn})
     if turn.get('status')!='completed':raise RuntimeError((turn.get('error') or {}).get('message') or 'Message did not complete.')
     return model['model']
 
@@ -73,23 +87,35 @@ def process_account(rpc, row, state, state_path):
     entry.update(attemptedReset=anchor, outcome='pending', attemptedAt=now, status='Sending hi')
     atomic_save(state_path, state)
     try:
-        model = send_hi(rpc, workspace)
+        receipt={'id':uuid.uuid4().hex,'accountId':ident,'startedAt':now,'resetDueAt':anchor,
+                 'status':'pending','evidence':'recorded','request':'hi','response':None,'before':bucket}
+        entry['lastRunId']=receipt['id']
+        atomic_save(state_path,state)
+        def persist(): write_receipt(DATA,receipt)
+        persist()
+        model = send_hi(rpc, workspace, receipt, persist)
     except Exception as error:
+        if 'receipt' in locals():
+            update(DATA,receipt,status='failed' if receipt.get('completionStatus')=='failed' else 'uncertain',error=str(error),finishedAt=time.time());persist()
         entry.update(outcome='uncertain', status='Warmup needs attention; no resend for this window', error=str(error), nextCheckAt=time.time()+1800)
         atomic_save(state_path, state)
         return
-    entry.update(outcome='completed', lastCompletedAt=time.time(), model=model, status='hi completed')
+    completed=time.time()
+    update(DATA,receipt,status='completed',completedAt=completed,durationMs=round((completed-now)*1000));persist()
+    entry.update(outcome='completed', lastCompletedAt=completed, model=model, status='hi completed')
     # Record completion before the follow-up read; quota failure must not undo it.
     atomic_save(state_path, state)
     try:
         after = read_account(rpc, ident)
         row['buckets']['codex'] = after; row['updatedAt'] = time.time()
+        update(DATA,receipt,after=after);persist()
         reset = (after.get('primary') or {}).get('resetsAt')
         if isinstance(reset, (int,float)) and reset > time.time():
             entry.update(nextReset=reset, nextCheckAt=reset+GRACE)
         else:
             entry.update(status='hi completed; reset time unconfirmed', nextCheckAt=time.time()+60)
     except Exception as error:
+        update(DATA,receipt,quotaRefreshError=str(error));persist()
         entry.update(status='hi completed; quota refresh failed', error=str(error), nextCheckAt=time.time()+60)
     atomic_save(state_path, state)
 

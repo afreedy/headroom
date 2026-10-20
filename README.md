@@ -54,3 +54,11 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 Design inspired by the supplied AI in Design Report reference; captured source assets are excluded. Uses system fonts and an original SVG mark.
+
+## Warmup evidence
+
+Expand **Warmup runs → View evidence** on an account. Headroom reads the local runtime-generated receipt history automatically; open histories refresh every five seconds. Each recorded attempt shows model, reasoning effort, exact prompt and captured answer, thread/turn IDs, timestamps, runtime completion status, token counts when returned, errors and before/after quota snapshots. Download the full JSON receipt, including the allowlisted completion events, from the same view.
+
+Receipts are stored privately in `~/Library/Application Support/Headroom/warmup-runs/`. They are local evidence reported by the runtime, not a provider-signed audit record. Model routing events are retained if returned. Answer text is captured from completed agent-message events; authentication payloads and reasoning traces are not retained. Older ledger-only runs are explicitly labeled **Legacy · limited evidence** and never given fabricated prompts, replies or IDs. No old transcript can be reconstructed from a completion timestamp.
+
+The run history records send attempts. The latest automatic check, reason for skipping and next scheduled check remain on the account card; routine minute-by-minute skipped checks do not create inference-run receipts. The one-time verification runs are labeled separately and do not bypass the automatic scheduler's duplicate guard.

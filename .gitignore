@@ -20,3 +20,5 @@ auth.json
 warmup-targets.json
 warmup-state.json
 snapshots.json
+
+warmup-runs/

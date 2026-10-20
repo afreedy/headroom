@@ -13,7 +13,7 @@ def install(origin):
         raise SystemExit('Pass a dashboard origin, without a path.')
     data=Path.home()/'Library/Application Support/Headroom'
     app=data/'app'; app.mkdir(parents=True,exist_ok=True,mode=0o700)
-    for name in ('server.py','warmup.py'):
+    for name in ('server.py','warmup.py','receipts.py'):
         shutil.copy2(Path(__file__).parent/name,app/name)
     agents=Path.home()/'Library/LaunchAgents';agents.mkdir(exist_ok=True)
     path=agents/(LABEL+'.plist')

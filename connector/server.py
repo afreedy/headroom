@@ -27,6 +27,8 @@ class Rpc:
                 msg = json.loads(line)
                 if msg.get('id') in self.pending:
                     waiter, box = self.pending[msg['id']]; box.append(msg); waiter.set()
+                if getattr(self, 'capture_event', None) and msg.get('method'):
+                    self.capture_event(msg['method'], msg.get('params', {}))
                 if msg.get('method') == 'account/login/completed': self.login_result = msg.get('params', {})
                 if msg.get('method') == 'turn/completed':
                     self.turn_result = msg.get('params', {}).get('turn', {}); self.turn_done.set()
@@ -85,7 +87,11 @@ def refresh(warm=False):
                 rows[index] = row
                 if warm:
                     process_account(rpc, row, state, state_path)
-                row['warmup'] = state.get(row['id'], {})
+                row['warmup'] = dict(state.get(row['id'], {}))
+                from receipts import history
+                runs=history(DATA,row['id'],row['warmup'])
+                if runs:
+                    row['warmup']['latestRun']={k:runs[0].get(k) for k in ('id','status','evidence','startedAt','completedAt','model')}
             except Exception as e:
                 current = rows[index]
                 current['error'] = str(e); current['lastAttemptAt'] = time.time()
@@ -165,6 +171,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.command == 'GET' and self.path == '/usage':
                 result = refresh(); WAKE.set()
                 return self.reply(200, {**result, 'login': LOGIN})
+            if self.command == 'GET' and self.path.startswith('/runs?'):
+                from urllib.parse import urlparse, parse_qs
+                from receipts import history
+                ident=parse_qs(urlparse(self.path).query).get('account',[None])[0]
+                if ident not in {r['id'] for r in load()}: return self.reply(404, {'error':'Unknown account'})
+                path=DATA/'warmup-state.json';state=json.loads(path.read_text()) if path.exists() else {}
+                return self.reply(200, {'runs':history(DATA,ident,state.get(ident,{}))})
             if self.command == 'POST' and self.path.startswith('/login'):
                 from urllib.parse import urlparse, parse_qs
                 u = urlparse(self.path)
